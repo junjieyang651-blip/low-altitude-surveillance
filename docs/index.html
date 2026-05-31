@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>低空目标多元融合监视系统</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/echarts@5.4.0/dist/echarts.min.js"></script>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: "Microsoft YaHei", "PingFang SC", Arial, sans-serif; background: #f5f6fa; color: #2c3e50; }
+  .header { background: linear-gradient(90deg, #1a253a, #2c3e50); color: white; padding: 14px 24px; display: flex; align-items: center; justify-content: space-between; }
+  .header h1 { font-size: 18px; letter-spacing: 1px; }
+  .header .sub { font-size: 12px; opacity: 0.8; margin-left: 12px; }
+  .metrics { display: flex; gap: 12px; flex-wrap: wrap; }
+  .metric-card { background: rgba(255,255,255,0.12); padding: 6px 14px; border-radius: 6px; text-align: center; }
+  .metric-card .num { font-size: 18px; font-weight: bold; }
+  .metric-card .lbl { font-size: 11px; opacity: 0.85; }
+
+  .container { display: flex; height: calc(100vh - 60px); }
+  .sidebar { width: 320px; background: #fff; border-right: 1px solid #e1e4e8; display: flex; flex-direction: column; overflow: hidden; }
+  .panel { flex: 1; overflow-y: auto; padding: 12px; }
+  .panel h3 { font-size: 13px; color: #7f8c8d; margin-bottom: 8px; }
+
+  .legend { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
+  .legend-item { display: flex; align-items: center; font-size: 12px; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; margin-right: 4px; }
+
+  .event-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  .event-table th { text-align: left; padding: 6px; background: #f8f9fa; color: #7f8c8d; font-weight: 600; position: sticky; top: 0; }
+  .event-table td { padding: 6px; border-bottom: 1px solid #f0f0f0; }
+  .event-table tr:hover { background: #f8f9fa; }
+  .badge { display: inline-block; padding: 1px 6px; border-radius: 4px; font-size: 11px; }
+  .bg-critical { background: #fdeaea; color: #c0392b; }
+  .bg-warning { background: #fef5e7; color: #d35400; }
+  .bg-caution { background: #fcf3cf; color: #b7950b; }
+  .bg-medium { background: #eaf2f8; color: #2874a6; }
+  .bg-high { background: #fadbd8; color: #c0392b; }
+
+  .map-wrap { flex: 1; position: relative; display: flex; flex-direction: column; }
+  #map { width: 100%; flex: 1; min-height: 50%; }
+  .chart-wrap { height: 35%; background: #fff; border-top: 1px solid #e1e4e8; padding: 10px; }
+  #flowChart { width: 100%; height: 100%; }
+
+  .tabs { display: flex; border-bottom: 1px solid #e1e4e8; }
+  .tab { flex: 1; padding: 10px; text-align: center; font-size: 13px; cursor: pointer; background: #f8f9fa; }
+  .tab.active { background: #fff; border-bottom: 2px solid #3498db; color: #3498db; font-weight: bold; }
+
+  ::-webkit-scrollbar { width: 6px; }
+  ::-webkit-scrollbar-thumb { background: #ccc; border-radius: 3px; }
+
+  @media (max-width: 768px) {
+    .container { flex-direction: column; height: auto; }
+    .sidebar { width: 100%; max-height: 300px; }
+    .map-wrap { min-height: 400px; }
+    .header { flex-direction: column; gap: 8px; }
+  }
+</style>
+</head>
+<body>
+<div class="header">
+  <div style="display:flex;align-items:center;">
+    <h1>低空目标多元融合监视系统</h1>
+    <span class="sub">多源低空目标融合监视平台</span>
+  </div>
+  <div class="metrics">
+    <div class="metric-card"><div class="num" id="m-targets">-</div><div class="lbl">峰值目标</div></div>
+    <div class="metric-card"><div class="num" id="m-anomaly">-</div><div class="lbl">异常事件</div></div>
+    <div class="metric-card"><div class="num" id="m-conflict">-</div><div class="lbl">冲突预警</div></div>
+    <div class="metric-card"><div class="num" id="m-corridor">-</div><div class="lbl">航线走廊</div></div>
+  </div>
+</div>
+
+<div class="container">
+  <div class="sidebar">
+    <div class="legend" style="padding:12px 12px 0;">
+      <div class="legend-item"><div class="dot" style="background:#e74c3c"></div>广播式自动监视</div>
+      <div class="legend-item"><div class="dot" style="background:#3498db"></div>远程识别</div>
+      <div class="legend-item"><div class="dot" style="background:#2ecc71"></div>雷达</div>
+      <div class="legend-item"><div class="dot" style="background:#f39c12"></div>融合航迹</div>
+    </div>
+    <div class="tabs">
+      <div class="tab active" onclick="switchTab('anomaly')">异常事件</div>
+      <div class="tab" onclick="switchTab('conflict')">冲突预警</div>
+    </div>
+    <div class="panel" id="panel-anomaly">
+      <h3>最近异常检测</h3>
+      <table class="event-table">
+        <thead><tr><th>时间</th><th>类型</th><th>航迹</th><th>等级</th></tr></thead>
+        <tbody id="tbody-anomaly"></tbody>
+      </table>
+    </div>
+    <div class="panel" id="panel-conflict" style="display:none;">
+      <h3>冲突预警列表</h3>
+      <table class="event-table">
+        <thead><tr><th>时间</th><th>目标对</th><th>最近距离(m)</th><th>碰撞时间(s)</th><th>等级</th></tr></thead>
+        <tbody id="tbody-conflict"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="map-wrap">
+    <div id="map"></div>
+    <div class="chart-wrap">
+      <div id="flowChart"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+// 数据基础路径
+const BASE = './data/';
+
+const map = L.map('map').setView([30.451, 114.009], 12);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+  maxZoom: 18, attribution: 'OpenStreetMap'
+}).addTo(map);
+
+const sourceColors = { adsb: '#e74c3c', remote_id: '#3498db', radar: '#2ecc71', fused: '#f39c12' };
+const sourceNamesCN = { adsb: '广播监视', remote_id: '远程识别', radar: '雷达', fused: '融合' };
+
+async function loadAll() {
+  // 摘要
+  const summary = await fetch(BASE + 'summary.json').then(r => r.json());
+  document.getElementById('m-targets').textContent = summary.peak_active_targets || 0;
+  document.getElementById('m-anomaly').textContent = summary.anomaly_count || 0;
+  document.getElementById('m-conflict').textContent = summary.conflict_count || 0;
+  document.getElementById('m-corridor').textContent = summary.corridor_count || 0;
+
+  // 航迹
+  const tracks = await fetch(BASE + 'tracks.json').then(r => r.json());
+  const group = L.featureGroup();
+  tracks.forEach(t => {
+    const color = sourceColors[t.source] || '#7f8c8d';
+    const latlngs = t.coords.map(c => [c[0], c[1]]);
+    const poly = L.polyline(latlngs, { color, weight: t.type === 'fused' ? 4 : 2, opacity: 0.85 });
+    poly.bindPopup(t.id + ' (' + (sourceNamesCN[t.source] || t.source) + ')');
+    poly.addTo(group);
+    if (latlngs.length > 0) {
+      L.circleMarker(latlngs[0], { radius: 4, fillColor: color, color: '#fff', weight: 1, fillOpacity: 1 }).addTo(group);
+    }
+  });
+  group.addTo(map);
+  if (tracks.length > 0) map.fitBounds(group.getBounds().pad(0.1));
+
+  // 异常
+  const anomalies = await fetch(BASE + 'anomalies.json').then(r => r.json());
+  const atbody = document.getElementById('tbody-anomaly');
+  const typeMap = {'overspeed':'超速','excessive_turn':'急转弯','altitude_violation':'高度越限','geofence_breach':'越界','abnormal_vertical':'垂直异常','stall_speed':'失速','altitude_ceiling':'高度上限','excessive_climb':'急爬升','excessive_descent':'急下降','impossible_accel':'异常加速','impossible_turn':'异常转弯','altitude_floor':'高度下限','signal_loss':'信号丢失','statistical_deviation_heading':'航向偏差','statistical_deviation_climb_rate':'爬升偏差'};
+  atbody.innerHTML = anomalies.slice(0, 50).map(ev => {
+    const sevClass = ev.severity === 'critical' ? 'bg-critical' : (ev.severity === 'high' ? 'bg-high' : 'bg-medium');
+    const sevLabel = ev.severity === 'critical' ? '严重' : (ev.severity === 'high' ? '高' : '中');
+    const typeCN = typeMap[ev.type] || ev.type || '';
+    return `<tr><td>${ev.time_sec !== undefined ? Number(ev.time_sec).toFixed(1) : '-'}</td><td>${typeCN}</td><td>${ev.track_id || ''}</td><td><span class="badge ${sevClass}">${sevLabel}</span></td></tr>`;
+  }).join('');
+
+  // 冲突
+  const conflicts = await fetch(BASE + 'conflicts.json').then(r => r.json());
+  const ctbody = document.getElementById('tbody-conflict');
+  ctbody.innerHTML = conflicts.slice(0, 50).map(ev => {
+    const lvlClass = ev.level === 'critical' ? 'bg-critical' : (ev.level === 'warning' ? 'bg-warning' : 'bg-caution');
+    const lvlLabel = ev.level === 'critical' ? '严重' : (ev.level === 'warning' ? '警告' : '注意');
+    return `<tr><td>${ev.time_sec !== undefined ? Number(ev.time_sec).toFixed(1) : '-'}</td><td>${ev.track_a || ''} vs ${ev.track_b || ''}</td><td>${ev.dcpa_m !== undefined ? Number(ev.dcpa_m).toFixed(0) : '-'}</td><td>${ev.tcpa_s !== undefined ? Number(ev.tcpa_s).toFixed(0) : '-'}</td><td><span class="badge ${lvlClass}">${lvlLabel}</span></td></tr>`;
+  }).join('');
+
+  // 流量图
+  const flow = await fetch(BASE + 'flow.json').then(r => r.json());
+  if (flow.times && flow.times.length > 0) {
+    const chart = echarts.init(document.getElementById('flowChart'));
+    chart.setOption({
+      title: { text: '低空流量时序', left: 0, textStyle: { fontSize: 13 } },
+      tooltip: { trigger: 'axis' },
+      legend: { data: ['活跃目标数', '报告总量'], right: 0, textStyle: { fontSize: 11 } },
+      grid: { left: 50, right: 20, top: 40, bottom: 30 },
+      xAxis: { type: 'category', data: flow.times.map(t => Number(t).toFixed(0) + '秒'), axisLabel: { fontSize: 11 } },
+      yAxis: { type: 'value', axisLabel: { fontSize: 11 } },
+      series: [
+        { name: '活跃目标数', type: 'line', data: flow.active, smooth: true, itemStyle: { color: '#3498db' }, areaStyle: { opacity: 0.1 } },
+        { name: '报告总量', type: 'line', data: flow.reports, smooth: true, itemStyle: { color: '#2ecc71' }, lineStyle: { type: 'dashed' } }
+      ]
+    });
+    window.addEventListener('resize', () => chart.resize());
+  }
+}
+
+function switchTab(tab) {
+  document.querySelectorAll('.tab').forEach(el => el.classList.remove('active'));
+  event.target.classList.add('active');
+  document.getElementById('panel-anomaly').style.display = tab === 'anomaly' ? 'block' : 'none';
+  document.getElementById('panel-conflict').style.display = tab === 'conflict' ? 'block' : 'none';
+}
+
+loadAll();
+</script>
+</body>
+</html>
