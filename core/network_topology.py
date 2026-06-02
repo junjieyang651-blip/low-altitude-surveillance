@@ -245,23 +245,136 @@ class AirspaceNetworkGraph:
         scores.sort(key=lambda x: x["composite_score"], reverse=True)
         return scores[:top_k]
 
+    def community_detection(self, max_iter: int = 50) -> Dict[str, int]:
+        """
+        社区检测（标签传播算法, Label Propagation）
+
+        识别低空交通网络中的独立航路群/社区结构。
+        每个社区代表一组相互紧密连接的航路。
+
+        Returns:
+            {node_id: community_id}
+        """
+        nodes = self.nodes
+        if not nodes:
+            return {}
+
+        # 初始化：每个节点为独立社区
+        labels = {node: i for i, node in enumerate(nodes)}
+
+        for iteration in range(max_iter):
+            changed = False
+            # 随机顺序遍历
+            order = np.random.permutation(len(nodes))
+            for idx in order:
+                node = nodes[idx]
+                # 收集邻居标签（加权投票）
+                neighbor_labels = defaultdict(float)
+                for nb, w in self.adjacency.get(node, {}).items():
+                    neighbor_labels[labels.get(nb, -1)] += w
+                # 反向邻居
+                for src, nbs in self.adjacency.items():
+                    if node in nbs:
+                        neighbor_labels[labels.get(src, -1)] += nbs[node]
+
+                if neighbor_labels:
+                    best_label = max(neighbor_labels, key=neighbor_labels.get)
+                    if best_label != labels[node]:
+                        labels[node] = best_label
+                        changed = True
+
+            if not changed:
+                break
+
+        # 重新编号社区ID
+        unique_labels = list(set(labels.values()))
+        remap = {old: new for new, old in enumerate(unique_labels)}
+        return {node: remap[labels[node]] for node in nodes}
+
+    def vulnerability_analysis(self, top_k: int = 5) -> List[Dict]:
+        """
+        网络脆弱性分析
+
+        评估移除某个节点后对网络连通性的影响（单点失效分析）。
+        对于低空经济安全监管：脆弱节点 = 一旦该区域失效，大量航路中断。
+
+        Returns:
+            脆弱节点列表（按影响度降序）
+        """
+        nodes = self.nodes
+        N = len(nodes)
+        if N < 5:
+            return []
+
+        # 原始网络连通分量数
+        original_components = self._count_components()
+
+        # 基于介数选取候选节点（避免全遍历太慢）
+        bc = self.betweenness_centrality(sample_size=min(100, N))
+        candidates = sorted(bc.items(), key=lambda x: x[1], reverse=True)[:min(30, N)]
+
+        results = []
+        for node_id, _ in candidates:
+            # 模拟移除该节点后的连通性
+            new_components = self._count_components(exclude_node=node_id)
+            delta = new_components - original_components
+            # 该节点承载的流量
+            traffic = self.node_traffic.get(node_id, 0)
+
+            e, n = self._node_id_to_enu(node_id)
+            results.append({
+                "node_id": node_id,
+                "e": e, "n": n,
+                "components_increase": delta,
+                "traffic_load": traffic,
+                "vulnerability_score": delta * 0.5 + (traffic / max(sum(self.node_traffic.values()), 1)) * 0.5,
+            })
+
+        results.sort(key=lambda x: x["vulnerability_score"], reverse=True)
+        return results[:top_k]
+
+    def _count_components(self, exclude_node: str = None) -> int:
+        """计算连通分量数（可排除指定节点）"""
+        nodes = set(self.nodes)
+        if exclude_node:
+            nodes.discard(exclude_node)
+
+        visited = set()
+        components = 0
+
+        for start in nodes:
+            if start in visited:
+                continue
+            components += 1
+            # BFS
+            queue = [start]
+            while queue:
+                curr = queue.pop()
+                if curr in visited:
+                    continue
+                visited.add(curr)
+                for nb in self.adjacency.get(curr, {}):
+                    if nb != exclude_node and nb not in visited:
+                        queue.append(nb)
+                for src, nbs in self.adjacency.items():
+                    if src != exclude_node and curr in nbs and src not in visited:
+                        queue.append(src)
+
+        return components
+
     def network_statistics(self) -> Dict:
         """网络全局统计"""
         nodes = self.nodes
         N = len(nodes)
         E = self.n_edges
 
-        # 平均度
         avg_degree = 2.0 * E / N if N > 0 else 0
-
-        # 图密度
         density = E / (N * (N - 1)) if N > 1 else 0
 
-        # 聚类系数（简化：局部三角形密度）
+        # 聚类系数（采样计算）
         clustering_coeffs = []
-        for node in nodes[:100]:  # 采样100个节点
+        for node in nodes[:100]:
             neighbors = set(self.adjacency.get(node, {}).keys())
-            # 加入反向邻居
             for src, nb in self.adjacency.items():
                 if node in nb:
                     neighbors.add(src)
@@ -269,7 +382,6 @@ class AirspaceNetworkGraph:
             if k < 2:
                 clustering_coeffs.append(0.0)
                 continue
-            # 计算邻居间的连接数
             links = 0
             neighbor_list = list(neighbors)
             for i in range(len(neighbor_list)):
@@ -281,31 +393,34 @@ class AirspaceNetworkGraph:
 
         avg_clustering = np.mean(clustering_coeffs) if clustering_coeffs else 0
 
+        # 社区检测
+        communities = self.community_detection()
+        n_communities = len(set(communities.values())) if communities else 0
+
         return {
             "n_nodes": N,
             "n_edges": E,
             "average_degree": round(avg_degree, 2),
             "density": round(density, 6),
             "average_clustering_coefficient": round(float(avg_clustering), 4),
+            "n_communities": n_communities,
         }
 
     def generate_report(self, fused_tracks: Dict[str, pd.DataFrame]) -> Dict:
         """
         生成完整网络分析报告
 
-        Args:
-            fused_tracks: 融合航迹字典
-
-        Returns:
-            完整的网络分析报告
+        包含：全局统计 + 核心风险节点 + 社区结构 + 脆弱性分析
         """
         self.build_from_tracks(fused_tracks)
 
         stats = self.network_statistics()
         critical_nodes = self.identify_critical_nodes(top_k=15)
+        vulnerable = self.vulnerability_analysis(top_k=10)
 
         return {
             "network_statistics": stats,
             "critical_risk_nodes": critical_nodes,
+            "vulnerability_analysis": vulnerable,
             "total_tracks_analyzed": len(fused_tracks),
         }

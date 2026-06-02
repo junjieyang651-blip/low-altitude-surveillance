@@ -24,7 +24,6 @@ from core.association import TrackAssociator
 from core.fusion import TrackFusionEngine
 from core.imm_fusion import IMMFusionEngine
 from core.ds_evidence import DSEvidenceEngine
-from core.spectrum_pog import SpectrumPOGProcessor
 from core.classification import TargetClassifier
 from core.anomaly_detection import AnomalyDetector
 from core.conflict_detection import ConflictDetector
@@ -193,30 +192,81 @@ def run_pipeline(data_dir: str, output_dir: str):
         temporal_df.to_csv(os.path.join(output_dir, "temporal_flow.csv"), index=False)
 
     # ---------------------------
-    # Step 8: D-S证据理论可信度评估
+    # Step 8: 频谱概率占据网格 (POG)
     # ---------------------------
-    print("\n[Step 8] D-S证据理论航迹可信度评估...")
-    ds_engine = DSEvidenceEngine(conflict_threshold=0.7)
+    print("\n[Step 8] 频谱概率占据网格 (POG) 分析...")
+    from core.spectrum_pog import SpectrumPOGProcessor
+    pog_processor = SpectrumPOGProcessor(
+        grid_size_m=200.0, extent_m=8000.0,
+        ref_lat=aligner.ref_lat, ref_lon=aligner.ref_lon
+    )
+    spectrum_data = datasets.get("spectrum", pd.DataFrame())
+    if not spectrum_data.empty:
+        pog_report = pog_processor.generate_report(spectrum_data)
+        print(f"  传感器数: {pog_report['n_sensors']}")
+        print(f"  总检测数: {pog_report['n_detections']}")
+        print(f"  多站交叉定位事件: {pog_report['n_multistation_events']}")
+        print(f"  高概率网格数: {pog_report['high_probability_cells']}")
+        print(f"  空间覆盖率: {pog_report['coverage_ratio']:.4f}")
+        with open(os.path.join(output_dir, "spectrum_pog_report.json"), "w", encoding="utf-8") as f:
+            json.dump(convert_for_json(pog_report), f, ensure_ascii=False, indent=2)
+    else:
+        print("  无频谱数据，跳过POG分析")
+
+    # ---------------------------
+    # Step 9: D-S证据理论可信度评估
+    # ---------------------------
+    print("\n[Step 9] D-S证据理论航迹可信度评估...")
+    ds_engine = DSEvidenceEngine(conflict_threshold=0.65)
     credibility_results = []
-    for stid, fdf in list(fused_tracks.items())[:100]:  # 采样评估
-        sources_in_track = fdf["sources"].unique() if "sources" in fdf.columns else []
-        observations = [{"source": s, "detected": True, "signal_quality": 0.8} for s in sources_in_track[:4]]
+    # 对多源融合航迹进行真正的冲突评估
+    for stid, fdf in list(fused_tracks.items())[:200]:
+        if "sources" not in fdf.columns:
+            continue
+        sources_in_track = fdf["sources"].unique()
+        # 构建观测证据（利用实际源种类和数量）
+        observations = []
+        for s in sources_in_track[:5]:
+            # 计算该源观测与融合位置的平均偏差
+            src_data = None
+            for src_name, src_df in datasets.items():
+                if src_name == s:
+                    src_data = src_df
+                    break
+            pos_error = None
+            if src_data is not None and "e" in src_data.columns and "e" in fdf.columns:
+                fused_mean_e = fdf["e"].mean()
+                fused_mean_n = fdf["n"].mean()
+                # 取该源中任一target_id的平均位置
+                src_mean_e = src_data["e"].mean()
+                src_mean_n = src_data["n"].mean()
+                pos_error = float(np.sqrt((src_mean_e - fused_mean_e)**2 + (src_mean_n - fused_mean_n)**2))
+
+            observations.append({
+                "source": s,
+                "detected": True,
+                "signal_quality": 0.85 if s in ["adsb", "remote_id"] else 0.65,
+                "position_error_m": pos_error,
+            })
         if observations:
             result = ds_engine.evaluate_track_credibility(observations)
             result["system_track_id"] = stid
+            result["n_sources"] = len(sources_in_track)
             credibility_results.append(result)
     if credibility_results:
         cred_df = pd.DataFrame(credibility_results)
         cred_df.to_csv(os.path.join(output_dir, "track_credibility.csv"), index=False)
-        confirmed_real = (cred_df["decision"] == "confirmed_real").sum()
         print(f"  评估航迹: {len(cred_df)} 条")
-        print(f"  确认真实: {confirmed_real}, 疑似虚假: {(cred_df['decision'] == 'suspected_false').sum()}")
+        print(f"  确认真实: {(cred_df['decision'] == 'confirmed_real').sum()}")
+        print(f"  疑似虚假: {(cred_df['decision'] == 'suspected_false').sum()}")
         print(f"  高冲突: {(cred_df['decision'] == 'high_conflict').sum()}")
+        print(f"  不确定: {(cred_df['decision'] == 'uncertain').sum()}")
+        print(f"  融合策略: Dempster={( cred_df['strategy'] == 'dempster').sum()}, Murphy={(cred_df['strategy'] == 'murphy').sum()}")
 
     # ---------------------------
-    # Step 9: 复杂网络拓扑分析
+    # Step 10: 复杂网络拓扑分析
     # ---------------------------
-    print("\n[Step 9] 低空复杂网络拓扑分析...")
+    print("\n[Step 10] 低空复杂网络拓扑分析...")
     net_graph = AirspaceNetworkGraph(grid_size_m=500.0)
     net_report = net_graph.generate_report(fused_tracks)
     stats = net_report["network_statistics"]
@@ -224,11 +274,15 @@ def run_pipeline(data_dir: str, output_dir: str):
     print(f"  网络边数: {stats['n_edges']}")
     print(f"  平均度: {stats['average_degree']}")
     print(f"  聚类系数: {stats['average_clustering_coefficient']}")
+    print(f"  社区数: {stats.get('n_communities', 0)}")
     print(f"  核心风险节点 (Top 5):")
     for cn in net_report["critical_risk_nodes"][:5]:
         print(f"    {cn['node_id']}: 综合分={cn['composite_score']:.4f}, 介数={cn['betweenness_centrality']:.4f}")
+    if net_report.get("vulnerability_analysis"):
+        print(f"  脆弱节点 (Top 3):")
+        for vn in net_report["vulnerability_analysis"][:3]:
+            print(f"    {vn['node_id']}: 脆弱分={vn['vulnerability_score']:.4f}, 流量={vn['traffic_load']}")
     with open(os.path.join(output_dir, "network_analysis.json"), "w", encoding="utf-8") as f:
-        # 转换set为list以便json序列化
         json.dump(convert_for_json(net_report), f, ensure_ascii=False, indent=2)
 
     print("\n" + "=" * 60)

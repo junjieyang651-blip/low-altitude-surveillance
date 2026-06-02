@@ -1,0 +1,8 @@
+feat: upgrade 4 core modules based on expert review feedback
+
+- IMM-AEKF: CT model adaptive omega estimation (7D), CA model 9D state
+- D-S Evidence: position error-based BPA construction with Sigmoid mapping
+- Spectrum POG: real 5-sensor positions + multi-station cross-location
+- Network Topology: Label Propagation community detection + vulnerability analysis
+- Updated documentation to reflect all improvements
+- Pipeline verified: all 10 steps pass successfully

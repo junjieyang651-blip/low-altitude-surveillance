@@ -261,7 +261,7 @@ class TrackAssociator:
                 if not tracks_a or not tracks_b:
                     continue
 
-                print(f"  关联 {sa}({len(tracks_a)} 条) ↔ {sb}({len(tracks_b)} 条)...")
+                print(f"  关联 {sa}({len(tracks_a)} 条) <-> {sb}({len(tracks_b)} 条)...")
 
                 # 粗筛：时间重叠 + 中心点距离阈值
                 # 根据源对动态调整：remote_id↔radar 目标多，阈值更紧
