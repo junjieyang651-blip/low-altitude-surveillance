@@ -376,9 +376,173 @@ class SpectrumPOGProcessor:
         ))
         return self.grid.match_with_track(points)
 
-    def generate_report(self, spectrum_df: pd.DataFrame) -> Dict:
-        """生成频谱POG分析报告"""
+    def false_alarm_filter(self, spectrum_df: pd.DataFrame,
+                            fused_tracks: Dict[str, pd.DataFrame] = None,
+                            time_window: float = 10.0) -> Dict:
+        """
+        频谱虚警过滤与干扰信号识别
+
+        解决问题: 频谱检测容易受多径效应、环境干扰影响，产生"虚警"
+        （没有目标却检测到信号）
+
+        虚警识别策略:
+        1. 单站孤立检测: 只有一个传感器检测到且无临近时间确认 → 高虚警概率
+        2. 频率异常: 检测频率不在已知无人机常用频段 → 可能为干扰
+        3. 时空不一致: 频谱检测位置无任何融合航迹经过 → 虚警或未知目标
+        4. 闪烁检测: 极短时间内反复出现/消失 → 多径干扰特征
+
+        Args:
+            spectrum_df: 频谱检测数据
+            fused_tracks: 融合航迹（用于时空一致性检查）
+            time_window: 时间窗口 (s)
+
+        Returns:
+            {
+                "total_detections": int,
+                "false_alarms": int,
+                "confirmed_detections": int,
+                "false_alarm_rate": float,
+                "interference_events": [{time, sensor, frequency, reason}],
+                "filter_breakdown": {reason: count},
+            }
+        """
+        if spectrum_df.empty:
+            return {"total_detections": 0, "false_alarms": 0, "confirmed_detections": 0,
+                    "false_alarm_rate": 0.0, "interference_events": [], "filter_breakdown": {}}
+
+        # 无人机常用频段 (MHz)
+        uav_freq_bands = [
+            (2400, 2483),   # 2.4GHz WiFi/图传
+            (5725, 5850),   # 5.8GHz 图传
+            (900, 930),     # 900MHz 遥控
+            (1427, 1518),   # L波段
+            (5030, 5091),   # C-Band
+        ]
+
+        # 识别传感器位置
+        if not hasattr(self, '_sensor_lookup') or not self._sensor_lookup:
+            self._identify_sensors(spectrum_df)
+
+        results = {
+            "total_detections": len(spectrum_df),
+            "false_alarms": 0,
+            "confirmed_detections": 0,
+            "false_alarm_rate": 0.0,
+            "interference_events": [],
+            "filter_breakdown": defaultdict(int),
+        }
+
+        # 按目标和时间窗口分组分析
+        if "time_sec" not in spectrum_df.columns:
+            return results
+
+        spectrum_df = spectrum_df.copy()
+        t_min = spectrum_df["time_sec"].min()
+        spectrum_df["time_bin"] = ((spectrum_df["time_sec"] - t_min) / time_window).astype(int)
+
+        lon_col = self._lon_col if hasattr(self, '_lon_col') else 'lon'
+        lat_col = self._lat_col if hasattr(self, '_lat_col') else 'lat'
+
+        false_alarm_flags = []  # 每条记录的虚警判定
+
+        for (tid, tbin), group in spectrum_df.groupby(["target_id", "time_bin"]):
+            # 检查该目标在此时间窗口被几个站检测到
+            detecting_sensors = set()
+            for _, row in group.iterrows():
+                if pd.notna(row.get(lon_col)) and pd.notna(row.get(lat_col)):
+                    idx = self._get_sensor_idx(row[lon_col], row[lat_col])
+                    detecting_sensors.add(idx)
+
+            is_false_alarm = False
+            reason = None
+
+            # 策略1: 单站孤立检测
+            if len(detecting_sensors) == 1 and len(group) <= 2:
+                is_false_alarm = True
+                reason = "single_station_isolated"
+
+            # 策略2: 频率异常检查
+            if not is_false_alarm and "frequency" in spectrum_df.columns:
+                freqs = group["frequency"].dropna()
+                if len(freqs) > 0:
+                    avg_freq = freqs.mean()
+                    in_band = any(lo <= avg_freq <= hi for lo, hi in uav_freq_bands)
+                    if not in_band and avg_freq > 0:
+                        is_false_alarm = True
+                        reason = "frequency_out_of_band"
+
+            # 策略3: 闪烁检测（短时间内密集出现又消失）
+            if not is_false_alarm and len(group) >= 3:
+                times = group["time_sec"].sort_values().values
+                intervals = np.diff(times)
+                if len(intervals) >= 2:
+                    # 间隔极不规则（变异系数 > 1.5）→ 可能多径干扰
+                    if np.std(intervals) > 0 and np.mean(intervals) > 0:
+                        cv = np.std(intervals) / np.mean(intervals)
+                        if cv > 1.5 and np.mean(intervals) < 2.0:
+                            is_false_alarm = True
+                            reason = "flicker_multipath"
+
+            # 策略4: 时空不一致性（与融合航迹对比）
+            if not is_false_alarm and fused_tracks and len(detecting_sensors) >= 2:
+                # 检查该时段是否有融合航迹经过检测区域
+                t_center = group["time_sec"].mean()
+                has_corroboration = False
+                # 检查检测传感器覆盖区内是否有融合航迹
+                det_positions = [self.sensor_enu_positions.get(i, (0, 0)) for i in detecting_sensors]
+                center_e = np.mean([p[0] for p in det_positions])
+                center_n = np.mean([p[1] for p in det_positions])
+
+                for stid, fdf in list(fused_tracks.items())[:50]:
+                    if "time_sec" not in fdf.columns or "e" not in fdf.columns:
+                        continue
+                    # 检查时间重叠
+                    t_overlap = fdf[(fdf["time_sec"] >= t_center - time_window) &
+                                     (fdf["time_sec"] <= t_center + time_window)]
+                    if t_overlap.empty:
+                        continue
+                    # 检查空间接近度
+                    dist = np.sqrt((t_overlap["e"].mean() - center_e)**2 +
+                                   (t_overlap["n"].mean() - center_n)**2)
+                    if dist < self.grid.detection_range * 0.8:
+                        has_corroboration = True
+                        break
+
+                if not has_corroboration:
+                    # 多站检测但无融合航迹印证，标记为疑似虚警
+                    is_false_alarm = True
+                    reason = "no_track_corroboration"
+
+            if is_false_alarm:
+                results["false_alarms"] += len(group)
+                results["filter_breakdown"][reason] += 1
+                results["interference_events"].append({
+                    "time_sec": float(group["time_sec"].mean()),
+                    "target_id": str(tid),
+                    "n_detections": len(group),
+                    "n_sensors": len(detecting_sensors),
+                    "reason": reason,
+                })
+            else:
+                results["confirmed_detections"] += len(group)
+
+        # 统计汇总
+        total = results["total_detections"]
+        results["false_alarm_rate"] = round(results["false_alarms"] / max(total, 1), 4)
+        results["filter_breakdown"] = dict(results["filter_breakdown"])
+        # 只保留Top 20虚警事件
+        results["interference_events"] = results["interference_events"][:20]
+
+        return results
+
+    def generate_report(self, spectrum_df: pd.DataFrame,
+                         fused_tracks: Dict[str, pd.DataFrame] = None) -> Dict:
+        """生成频谱POG分析报告（含虚警分析）"""
         result = self.process_spectrum_data(spectrum_df)
+
+        # 虚警过滤分析
+        fa_result = self.false_alarm_filter(spectrum_df, fused_tracks=fused_tracks)
+
         return {
             "n_detections": result["n_detections"],
             "n_multistation_events": result["n_multistation"],
@@ -387,4 +551,12 @@ class SpectrumPOGProcessor:
             "coverage_ratio": result["coverage_ratio"],
             "high_probability_cells": len(result["high_prob_cells"]),
             "sensor_positions_enu": {str(k): v for k, v in result.get("sensor_positions_enu", {}).items()},
+            "false_alarm_analysis": {
+                "total_detections": fa_result["total_detections"],
+                "false_alarms": fa_result["false_alarms"],
+                "confirmed_detections": fa_result["confirmed_detections"],
+                "false_alarm_rate": fa_result["false_alarm_rate"],
+                "filter_breakdown": fa_result["filter_breakdown"],
+                "interference_events_sample": fa_result["interference_events"][:5],
+            },
         }

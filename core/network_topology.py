@@ -410,17 +410,159 @@ class AirspaceNetworkGraph:
         """
         生成完整网络分析报告
 
-        包含：全局统计 + 核心风险节点 + 社区结构 + 脆弱性分析
+        包含：全局统计 + 核心风险节点 + 社区结构 + 脆弱性分析 + 空域容量评估
         """
         self.build_from_tracks(fused_tracks)
 
         stats = self.network_statistics()
         critical_nodes = self.identify_critical_nodes(top_k=15)
         vulnerable = self.vulnerability_analysis(top_k=10)
+        capacity = self.airspace_capacity_analysis(fused_tracks)
 
         return {
             "network_statistics": stats,
             "critical_risk_nodes": critical_nodes,
             "vulnerability_analysis": vulnerable,
+            "airspace_capacity": capacity,
             "total_tracks_analyzed": len(fused_tracks),
+        }
+
+    def airspace_capacity_analysis(self, fused_tracks: Dict[str, pd.DataFrame]) -> Dict:
+        """
+        空域容量与拥堵度分析 (Airspace Congestion & Dynamic Capacity)
+
+        核心定义:
+        - 空域拥堵度 (Congestion Index, CI):
+          CI(node, t) = 单位时间窗口内经过该节点的航迹数 / 节点动态容量
+          CI > 1.0 表示超载（拥堵）
+
+        - 动态容量阈值 (Dynamic Capacity Threshold, DCT):
+          基于节点的空间尺度、通达的连通度、历史平均流量计算
+          DCT = α * degree * grid_area / min_separation^2
+          其中 α 为安全系数, min_separation 为最小安全间距
+
+        - 社区容量 (Community Capacity):
+          每个社区内所有节点DCT之和，代表该航路群的总容纳能力
+
+        Returns:
+            {
+                "congestion_nodes": [{node_id, congestion_index, capacity, traffic, ...}],
+                "community_capacity": [{community_id, total_capacity, current_load, utilization}],
+                "global_congestion_index": float,
+                "congested_ratio": float,
+                "capacity_summary": str
+            }
+        """
+        nodes = self.nodes
+        if not nodes:
+            return {"congestion_nodes": [], "community_capacity": [], "global_congestion_index": 0,
+                    "congested_ratio": 0, "capacity_summary": "no data"}
+
+        # ---- 计算每个节点的动态容量 (DCT) ----
+        # 参数
+        min_separation_m = 100.0  # 低空最小安全间距 (m)
+        safety_factor = 0.6  # 安全系数 (保守设计)
+        grid_area = self.grid_size ** 2  # 网格面积 (m^2)
+
+        # 节点度数
+        out_degree = defaultdict(int)
+        in_degree = defaultdict(int)
+        for src, neighbors in self.adjacency.items():
+            out_degree[src] += len(neighbors)
+            for dst in neighbors:
+                in_degree[dst] += 1
+
+        node_capacity = {}  # {node_id: DCT}
+        for node in nodes:
+            degree = out_degree.get(node, 0) + in_degree.get(node, 0)
+            # DCT = safety * degree * grid_area / min_separation^2
+            # 物理含义: 连接越多的节点，容量越大（因为进出方向多）
+            dct = safety_factor * max(degree, 1) * grid_area / (min_separation_m ** 2)
+            # 限制在合理范围: [1, 50]
+            dct = max(1.0, min(50.0, dct))
+            node_capacity[node] = dct
+
+        # ---- 时间窗口内的实时流量统计 ----
+        # 统计每个节点在整个时间跨度内的平均流量密度
+        # 总时间范围
+        all_times = []
+        for stid, fdf in fused_tracks.items():
+            if "time_sec" in fdf.columns and len(fdf) > 0:
+                all_times.extend([fdf["time_sec"].min(), fdf["time_sec"].max()])
+
+        if not all_times:
+            total_duration = 1.0
+        else:
+            total_duration = max(max(all_times) - min(all_times), 1.0)
+
+        time_window = 60.0  # 1分钟时间窗口
+        n_windows = max(1, int(total_duration / time_window))
+
+        # 节点拥堵度: 流量 / (容量 * 时间窗口数)
+        congestion_nodes = []
+        n_congested = 0
+        for node in nodes:
+            traffic = self.node_traffic.get(node, 0)
+            capacity = node_capacity.get(node, 1.0)
+            # 拥堵指数 = 总流量 / (容量 * 时间窗口数)
+            ci = traffic / (capacity * n_windows) if capacity * n_windows > 0 else 0
+
+            if traffic > 0:  # 只输出有流量的节点
+                e, n_coord = self._node_id_to_enu(node)
+                congestion_nodes.append({
+                    "node_id": node,
+                    "e": e, "n": n_coord,
+                    "congestion_index": round(ci, 4),
+                    "dynamic_capacity": round(capacity, 1),
+                    "traffic_count": traffic,
+                    "is_congested": ci > 1.0,
+                })
+                if ci > 1.0:
+                    n_congested += 1
+
+        congestion_nodes.sort(key=lambda x: x["congestion_index"], reverse=True)
+
+        # ---- 社区容量 ----
+        communities = self.community_detection()
+        community_stats = defaultdict(lambda: {"total_capacity": 0.0, "current_load": 0, "nodes": 0})
+
+        for node in nodes:
+            cid = communities.get(node, 0)
+            community_stats[cid]["total_capacity"] += node_capacity.get(node, 1.0)
+            community_stats[cid]["current_load"] += self.node_traffic.get(node, 0)
+            community_stats[cid]["nodes"] += 1
+
+        community_capacity = []
+        for cid, stats in community_stats.items():
+            utilization = stats["current_load"] / (stats["total_capacity"] * n_windows) if stats["total_capacity"] * n_windows > 0 else 0
+            community_capacity.append({
+                "community_id": cid,
+                "n_nodes": stats["nodes"],
+                "total_capacity": round(stats["total_capacity"], 1),
+                "current_load": stats["current_load"],
+                "utilization": round(utilization, 4),
+                "is_saturated": utilization > 0.8,
+            })
+
+        community_capacity.sort(key=lambda x: x["utilization"], reverse=True)
+
+        # 全局拥堵指数
+        total_traffic = sum(self.node_traffic.values())
+        total_capacity = sum(node_capacity.values())
+        global_ci = total_traffic / (total_capacity * n_windows) if total_capacity * n_windows > 0 else 0
+        congested_ratio = n_congested / max(len(congestion_nodes), 1)
+
+        n_saturated = sum(1 for c in community_capacity if c["is_saturated"])
+        summary = (f"全局拥堵指数={global_ci:.3f}, "
+                   f"拥堵节点占比={congested_ratio*100:.1f}%, "
+                   f"饱和社区={n_saturated}/{len(community_capacity)}")
+
+        return {
+            "congestion_nodes": congestion_nodes[:20],  # Top 20
+            "community_capacity": community_capacity[:10],  # Top 10
+            "global_congestion_index": round(global_ci, 4),
+            "congested_node_ratio": round(congested_ratio, 4),
+            "n_congested_nodes": n_congested,
+            "n_saturated_communities": n_saturated,
+            "capacity_summary": summary,
         }

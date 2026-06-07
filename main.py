@@ -20,7 +20,7 @@ import numpy as np
 from utils.io_utils import load_all_data
 from utils.coords import compute_centroid
 from core.time_align import SpatioTemporalAligner
-from core.association import TrackAssociator
+from core.association import TrackAssociator, TrackMaintenance
 from core.fusion import TrackFusionEngine
 from core.imm_fusion import IMMFusionEngine
 from core.ds_evidence import DSEvidenceEngine
@@ -33,6 +33,19 @@ from core.network_topology import AirspaceNetworkGraph
 
 def run_pipeline(data_dir: str, output_dir: str):
     os.makedirs(output_dir, exist_ok=True)
+
+    # \u5c06 numpy \u7c7b\u578b\u8f6c\u4e3a\u539f\u751f Python \u7c7b\u578b\u4ee5\u4fbf JSON \u5e8f\u5217\u5316
+    def convert_for_json(obj):
+        if isinstance(obj, dict):
+            return {k: convert_for_json(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [convert_for_json(v) for v in obj]
+        if isinstance(obj, (np.integer, np.int64, np.int32)):
+            return int(obj)
+        if isinstance(obj, (np.floating, np.float64, np.float32)):
+            return float(obj)
+        return obj
+
     print("=" * 60)
     print("低空目标多元融合监视系统 — 主流水线")
     print(f"数据目录: {data_dir}")
@@ -76,16 +89,45 @@ def run_pipeline(data_dir: str, output_dir: str):
     # ---------------------------
     # Step 3: 航迹关联
     # ---------------------------
-    print("\n[Step 3/7] 多源异构航迹关联...")
+    print("\n[Step 3/7] \u591a\u6e90\u5f02\u6784\u822a\u8ff9\u5173\u8054...")
     associator = TrackAssociator()
     assoc_df = associator.associate_tracks_global(datasets, time_step=2.0)
     if not assoc_df.empty:
-        print(f"  关联对总数: {len(assoc_df)}")
+        print(f"  \u5173\u8054\u5bf9\u603b\u6570: {len(assoc_df)}")
         print(f"  confirmed: {(assoc_df['level'] == 'confirmed').sum()}")
         print(f"  suspected: {(assoc_df['level'] == 'suspected').sum()}")
         assoc_df.to_csv(os.path.join(output_dir, "association_results.csv"), index=False)
     else:
-        print("  未产生关联结果（可能数据时间覆盖不足）")
+        print("  \u672a\u4ea7\u751f\u5173\u8054\u7ed3\u679c\uff08\u53ef\u80fd\u6570\u636e\u65f6\u95f4\u8986\u76d6\u4e0d\u8db3\uff09")
+    
+    # \u822a\u8ff9\u7ef4\u6301 (Track Maintenance) - \u5904\u7406ID\u8df3\u53d8
+    print("\n  [\u822a\u8ff9\u7ef4\u6301] \u68c0\u6d4b\u65ad\u88c2\u822a\u8ff9\u5e76\u91cd\u5173\u8054...")
+    maintainer = TrackMaintenance(max_gap_sec=30.0, gate_radius_m=150.0)
+    maintenance_df = maintainer.detect_broken_tracks(datasets)
+    maint_stats = maintainer.get_maintenance_stats(maintenance_df)
+    print(f"    \u68c0\u6d4b\u65ad\u88c2\u822a\u8ff9\u5bf9: {maint_stats['total_broken']}")
+    print(f"    \u786e\u8ba4\u91cd\u5173\u8054: {maint_stats['confirmed']}")
+    print(f"    \u7591\u4f3c\u91cd\u5173\u8054: {maint_stats['suspected']}")
+    if not maintenance_df.empty:
+        maintenance_df.to_csv(os.path.join(output_dir, "track_maintenance.csv"), index=False)
+        # \u5c06\u786e\u8ba4\u7684\u91cd\u5173\u8054\u7ed3\u679c\u8865\u5145\u5230 assoc_df
+        confirmed_maint = maintenance_df[maintenance_df["status"] == "confirmed"]
+        if not confirmed_maint.empty:
+            extra_assoc = []
+            for _, row in confirmed_maint.iterrows():
+                extra_assoc.append({
+                    "time_sec": 0.0,
+                    "src_a": row["source"],
+                    "tid_a": row["tid_old"],
+                    "src_b": row["source"],
+                    "tid_b": row["tid_new"],
+                    "score": row["score"],
+                    "level": "confirmed",
+                    "dist_3d_m": row["pred_error_m"],
+                })
+            if extra_assoc:
+                assoc_df = pd.concat([assoc_df, pd.DataFrame(extra_assoc)], ignore_index=True)
+                print(f"    \u8865\u5145\u5173\u8054\u5bf9: {len(extra_assoc)} \u6761")
 
     # ---------------------------
     # Step 4: 航迹融合
@@ -93,8 +135,17 @@ def run_pipeline(data_dir: str, output_dir: str):
     print("\n[Step 4/7] IMM-AEKF动态航迹融合...")
     fusion_engine = IMMFusionEngine()
     fused_tracks = fusion_engine.build_fused_tracks(assoc_df, datasets, min_confidence="suspected")
-    print(f"  生成融合航迹数: {len(fused_tracks)}")
-    print(f"  融合引擎: IMM (CV/CT/CA三模型) + AEKF自适应滤波")
+    print(f"  \u751f\u6210\u878d\u5408\u822a\u8ff9\u6570: {len(fused_tracks)}")
+    print(f"  \u878d\u5408\u5f15\u64ce: IMM (CV/CT/CA\u4e09\u6a21\u578b) + AEKF\u81ea\u9002\u5e94\u6ee4\u6ce2")
+    
+    # RMSE\u91cf\u5316\u5bf9\u6bd4
+    rmse_metrics = fusion_engine.compute_rmse_metrics(fused_tracks, datasets, assoc_df)
+    print(f"  RMSE\u7cbe\u5ea6\u5bf9\u6bd4: {rmse_metrics['summary']}")
+    for src, m in rmse_metrics.get('per_source_rmse', {}).items():
+        imp = rmse_metrics.get('improvement_ratio_pct', {}).get(src, 0)
+        print(f"    {src}: RMSE={m['rmse_total_m']:.1f}m (\u878d\u5408\u6539\u8fdb{imp:.0f}%)")
+    with open(os.path.join(output_dir, "rmse_metrics.json"), "w", encoding="utf-8") as f:
+        json.dump(convert_for_json(rmse_metrics), f, ensure_ascii=False, indent=2)
     # 合并保存所有融合航迹到一个文件，避免数千次磁盘写入
     if fused_tracks:
         all_fused = []
@@ -170,22 +221,10 @@ def run_pipeline(data_dir: str, output_dir: str):
     print(f"    总时间跨度: {flow_report['total_time_span_sec']:.0f} s")
     print(f"    峰值活跃目标数: {flow_report['peak_active_targets']}")
     print(f"    总报告点数: {flow_report['total_reports']}")
-    print(f"    航线走廊数: {len(flow_report['corridors'])}")
-    # 将 numpy 类型转为原生 Python 类型以便 JSON 序列化
-    def convert_for_json(obj):
-        if isinstance(obj, dict):
-            return {k: convert_for_json(v) for k, v in obj.items()}
-        if isinstance(obj, list):
-            return [convert_for_json(v) for v in obj]
-        if isinstance(obj, (np.integer, np.int64, np.int32)):
-            return int(obj)
-        if isinstance(obj, (np.floating, np.float64, np.float32)):
-            return float(obj)
-        return obj
-
+    print(f"    \u822a\u7ebf\u8d70\u5eca\u6570: {len(flow_report['corridors'])}")
     with open(os.path.join(output_dir, "flow_report.json"), "w", encoding="utf-8") as f:
         json.dump(convert_for_json(flow_report), f, ensure_ascii=False, indent=2)
-
+    
     # 保存时域流量CSV
     temporal_df = flow.temporal_flow(datasets)
     if not temporal_df.empty:
@@ -202,12 +241,22 @@ def run_pipeline(data_dir: str, output_dir: str):
     )
     spectrum_data = datasets.get("spectrum", pd.DataFrame())
     if not spectrum_data.empty:
-        pog_report = pog_processor.generate_report(spectrum_data)
-        print(f"  传感器数: {pog_report['n_sensors']}")
-        print(f"  总检测数: {pog_report['n_detections']}")
-        print(f"  多站交叉定位事件: {pog_report['n_multistation_events']}")
-        print(f"  高概率网格数: {pog_report['high_probability_cells']}")
-        print(f"  空间覆盖率: {pog_report['coverage_ratio']:.4f}")
+        pog_report = pog_processor.generate_report(spectrum_data, fused_tracks=fused_tracks)
+        print(f"  \u4f20\u611f\u5668\u6570: {pog_report['n_sensors']}")
+        print(f"  \u603b\u68c0\u6d4b\u6570: {pog_report['n_detections']}")
+        print(f"  \u591a\u7ad9\u4ea4\u53c9\u5b9a\u4f4d\u4e8b\u4ef6: {pog_report['n_multistation_events']}")
+        print(f"  \u9ad8\u6982\u7387\u7f51\u683c\u6570: {pog_report['high_probability_cells']}")
+        print(f"  \u7a7a\u95f4\u8986\u76d6\u7387: {pog_report['coverage_ratio']:.4f}")
+        # \u865a\u8b66\u5206\u6790\u7ed3\u679c
+        fa = pog_report.get('false_alarm_analysis', {})
+        if fa:
+            print(f"  \u865a\u8b66\u5206\u6790: \u603b\u68c0\u6d4b={fa.get('total_detections',0)}, "
+                  f"\u865a\u8b66={fa.get('false_alarms',0)}, "
+                  f"\u786e\u8ba4={fa.get('confirmed_detections',0)}, "
+                  f"\u865a\u8b66\u7387={fa.get('false_alarm_rate',0):.2%}")
+            if fa.get('filter_breakdown'):
+                for reason, cnt in fa['filter_breakdown'].items():
+                    print(f"    {reason}: {cnt} \u6b21")
         with open(os.path.join(output_dir, "spectrum_pog_report.json"), "w", encoding="utf-8") as f:
             json.dump(convert_for_json(pog_report), f, ensure_ascii=False, indent=2)
     else:
@@ -270,18 +319,29 @@ def run_pipeline(data_dir: str, output_dir: str):
     net_graph = AirspaceNetworkGraph(grid_size_m=500.0)
     net_report = net_graph.generate_report(fused_tracks)
     stats = net_report["network_statistics"]
-    print(f"  网络节点数: {stats['n_nodes']}")
-    print(f"  网络边数: {stats['n_edges']}")
-    print(f"  平均度: {stats['average_degree']}")
-    print(f"  聚类系数: {stats['average_clustering_coefficient']}")
-    print(f"  社区数: {stats.get('n_communities', 0)}")
-    print(f"  核心风险节点 (Top 5):")
+    print(f"  \u7f51\u7edc\u8282\u70b9\u6570: {stats['n_nodes']}")
+    print(f"  \u7f51\u7edc\u8fb9\u6570: {stats['n_edges']}")
+    print(f"  \u5e73\u5747\u5ea6: {stats['average_degree']}")
+    print(f"  \u805a\u7c7b\u7cfb\u6570: {stats['average_clustering_coefficient']}")
+    print(f"  \u793e\u533a\u6570: {stats.get('n_communities', 0)}")
+    print(f"  \u6838\u5fc3\u98ce\u9669\u8282\u70b9 (Top 5):")
     for cn in net_report["critical_risk_nodes"][:5]:
-        print(f"    {cn['node_id']}: 综合分={cn['composite_score']:.4f}, 介数={cn['betweenness_centrality']:.4f}")
+        print(f"    {cn['node_id']}: \u7efc\u5408\u5206={cn['composite_score']:.4f}, \u4ecb\u6570={cn['betweenness_centrality']:.4f}")
     if net_report.get("vulnerability_analysis"):
-        print(f"  脆弱节点 (Top 3):")
+        print(f"  \u8106\u5f31\u8282\u70b9 (Top 3):")
         for vn in net_report["vulnerability_analysis"][:3]:
-            print(f"    {vn['node_id']}: 脆弱分={vn['vulnerability_score']:.4f}, 流量={vn['traffic_load']}")
+            print(f"    {vn['node_id']}: \u8106\u5f31\u5206={vn['vulnerability_score']:.4f}, \u6d41\u91cf={vn['traffic_load']}")
+    # \u7a7a\u57df\u5bb9\u91cf\u5206\u6790
+    capacity = net_report.get("airspace_capacity", {})
+    if capacity:
+        print(f"  \u7a7a\u57df\u5bb9\u91cf\u5206\u6790: {capacity.get('capacity_summary', '')}")
+        print(f"    \u62e5\u5835\u8282\u70b9\u6570: {capacity.get('n_congested_nodes', 0)}")
+        print(f"    \u9971\u548c\u793e\u533a\u6570: {capacity.get('n_saturated_communities', 0)}")
+        top_congested = capacity.get('congestion_nodes', [])[:3]
+        if top_congested:
+            print(f"    Top3\u62e5\u5835\u8282\u70b9:")
+            for cn in top_congested:
+                print(f"      {cn['node_id']}: CI={cn['congestion_index']:.3f}, \u5bb9\u91cf={cn['dynamic_capacity']:.0f}, \u6d41\u91cf={cn['traffic_count']}")
     with open(os.path.join(output_dir, "network_analysis.json"), "w", encoding="utf-8") as f:
         json.dump(convert_for_json(net_report), f, ensure_ascii=False, indent=2)
 

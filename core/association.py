@@ -8,6 +8,7 @@
 """
 
 import math
+import bisect
 import numpy as np
 import pandas as pd
 from typing import Dict, List, Tuple, Optional
@@ -391,3 +392,200 @@ class TrackAssociator:
                     })
 
         return pd.DataFrame(records)
+
+
+class TrackMaintenance:
+    """
+    航迹维持引擎 (Track Maintenance)
+
+    解决问题: 雷达目标ID跳变（航迹断裂后重新编号）导致同一物理目标被分成多段。
+
+    核心方法:
+    1. 断裂检测: 同一源内两段航迹，前段消失时间 < max_gap_sec，且后段出现位置
+       与前段末端外推位置接近 → 候选重关联对
+    2. 位置预测匹配: 用前段末端的速度/航向外推到后段起始时间，计算预测位置
+       与后段起点的残差，若 < gate_radius_m 则判定为同一目标
+    3. 特征匹配: 速度大小差异、航向差异、高度差异作为辅助确认条件
+    4. 输出额外关联对（补充到 association_df 中）
+
+    参考文献:
+      [1] Bar-Shalom et al., "Estimation with Applications to Tracking", 2001
+      [2] Blackman & Popoli, "Design and Analysis of Modern Tracking Systems", 1999
+    """
+
+    def __init__(self, max_gap_sec: float = 30.0, gate_radius_m: float = 150.0,
+                 max_speed_diff_ratio: float = 0.4, max_heading_diff_deg: float = 45.0):
+        self.max_gap_sec = max_gap_sec
+        self.gate_radius_m = gate_radius_m
+        self.max_speed_diff_ratio = max_speed_diff_ratio
+        self.max_heading_diff_deg = max_heading_diff_deg
+
+    def detect_broken_tracks(self, datasets: Dict[str, pd.DataFrame]) -> pd.DataFrame:
+        """
+        检测并重关联断裂航迹
+
+        对每个数据源内部:
+        1. 提取每条航迹的起止时间、起止位置、起止速度
+        2. 寻找"结束-开始"间隔 < max_gap_sec 的候选对
+        3. 用末端速度外推，计算预测门控
+        4. 综合特征判决
+
+        Returns:
+            重关联结果 DataFrame, 列: src, tid_old, tid_new, gap_sec, pred_error_m, score, status
+        """
+        results = []
+
+        for src, df in datasets.items():
+            if src == "spectrum":
+                continue
+            if "e" not in df.columns or "n" not in df.columns:
+                continue
+            if "time_sec" not in df.columns:
+                continue
+
+            # 建立每条航迹的摘要
+            track_summaries = []
+            for tid, grp in df.groupby("target_id"):
+                if len(grp) < 3:
+                    continue
+                sorted_grp = grp.sort_values("time_sec")
+                first = sorted_grp.iloc[0]
+                last = sorted_grp.iloc[-1]
+
+                # 末端速度估计（取最后3个点平均）
+                tail = sorted_grp.tail(min(5, len(sorted_grp)))
+                if len(tail) >= 2:
+                    dt_tail = tail["time_sec"].iloc[-1] - tail["time_sec"].iloc[0]
+                    if dt_tail > 0:
+                        ve_end = (tail["e"].iloc[-1] - tail["e"].iloc[0]) / dt_tail
+                        vn_end = (tail["n"].iloc[-1] - tail["n"].iloc[0]) / dt_tail
+                    else:
+                        ve_end, vn_end = 0.0, 0.0
+                else:
+                    ve_end, vn_end = 0.0, 0.0
+
+                speed_end = math.sqrt(ve_end**2 + vn_end**2)
+                heading_end = math.degrees(math.atan2(ve_end, vn_end)) % 360
+
+                # 首端速度
+                head = sorted_grp.head(min(5, len(sorted_grp)))
+                if len(head) >= 2:
+                    dt_head = head["time_sec"].iloc[-1] - head["time_sec"].iloc[0]
+                    if dt_head > 0:
+                        ve_start = (head["e"].iloc[-1] - head["e"].iloc[0]) / dt_head
+                        vn_start = (head["n"].iloc[-1] - head["n"].iloc[0]) / dt_head
+                    else:
+                        ve_start, vn_start = 0.0, 0.0
+                else:
+                    ve_start, vn_start = 0.0, 0.0
+
+                speed_start = math.sqrt(ve_start**2 + vn_start**2)
+                heading_start = math.degrees(math.atan2(ve_start, vn_start)) % 360
+
+                track_summaries.append({
+                    "tid": str(tid),
+                    "t_start": float(first["time_sec"]),
+                    "t_end": float(last["time_sec"]),
+                    "e_start": float(first["e"]), "n_start": float(first["n"]),
+                    "e_end": float(last["e"]), "n_end": float(last["n"]),
+                    "u_end": float(last.get("u", 0)) if not pd.isna(last.get("u", 0)) else 0.0,
+                    "u_start": float(first.get("u", 0)) if not pd.isna(first.get("u", 0)) else 0.0,
+                    "ve_end": ve_end, "vn_end": vn_end,
+                    "speed_end": speed_end, "heading_end": heading_end,
+                    "speed_start": speed_start, "heading_start": heading_start,
+                    "n_points": len(sorted_grp),
+                })
+
+            # 按结束时间排序，寻找候选重关联对
+            track_summaries.sort(key=lambda x: x["t_end"])
+
+            # 优化：建立按t_start排序的索引，只比较时间窗口内的候选
+            by_start = sorted(range(len(track_summaries)), key=lambda x: track_summaries[x]["t_start"])
+            start_times = [track_summaries[idx]["t_start"] for idx in by_start]
+
+            for i in range(len(track_summaries)):
+                old = track_summaries[i]
+                # 只在 t_start 在 [old.t_end+0.5, old.t_end+max_gap] 的范围内搜索
+                t_lo = old["t_end"] + 0.5
+                t_hi = old["t_end"] + self.max_gap_sec
+
+                # 二分查找起点
+                lo_idx = bisect.bisect_left(start_times, t_lo)
+                hi_idx = bisect.bisect_right(start_times, t_hi)
+
+                for k in range(lo_idx, hi_idx):
+                    j = by_start[k]
+                    if i == j:
+                        continue
+                    new = track_summaries[j]
+
+                    # 条件1: 新航迹开始在旧航迹结束之后
+                    gap = new["t_start"] - old["t_end"]
+
+                    # 条件2: 位置预测门控
+                    # 用旧航迹末端速度外推到新航迹起始时间
+                    pred_e = old["e_end"] + old["ve_end"] * gap
+                    pred_n = old["n_end"] + old["vn_end"] * gap
+                    actual_e = new["e_start"]
+                    actual_n = new["n_start"]
+                    pred_error = math.sqrt((pred_e - actual_e)**2 + (pred_n - actual_n)**2)
+
+                    if pred_error > self.gate_radius_m:
+                        continue
+
+                    # 条件3: 速度一致性
+                    if old["speed_end"] > 1.0 and new["speed_start"] > 1.0:
+                        speed_ratio = abs(old["speed_end"] - new["speed_start"]) / max(old["speed_end"], new["speed_start"])
+                        if speed_ratio > self.max_speed_diff_ratio:
+                            continue
+                    else:
+                        speed_ratio = 0.0
+
+                    # 条件4: 航向一致性
+                    dh = abs(old["heading_end"] - new["heading_start"])
+                    dh = min(dh, 360.0 - dh)
+                    if dh > self.max_heading_diff_deg:
+                        continue
+
+                    # 计算综合得分
+                    score = 1.0 - (pred_error / self.gate_radius_m) * 0.4 - speed_ratio * 0.3 - (dh / self.max_heading_diff_deg) * 0.3
+
+                    results.append({
+                        "source": src,
+                        "tid_old": old["tid"],
+                        "tid_new": new["tid"],
+                        "gap_sec": round(gap, 2),
+                        "pred_error_m": round(pred_error, 2),
+                        "speed_ratio": round(speed_ratio, 3),
+                        "heading_diff_deg": round(dh, 1),
+                        "score": round(score, 4),
+                        "status": "confirmed" if score >= 0.7 else "suspected",
+                    })
+
+        if not results:
+            return pd.DataFrame()
+
+        result_df = pd.DataFrame(results)
+        # 去重: 每个 tid_new 只能被一个 tid_old 认领（取得分最高的）
+        result_df = result_df.sort_values("score", ascending=False).drop_duplicates(subset=["source", "tid_new"], keep="first")
+        return result_df.reset_index(drop=True)
+
+    def get_maintenance_stats(self, maintenance_df: pd.DataFrame) -> Dict:
+        """统计航迹维持结果"""
+        if maintenance_df.empty:
+            return {"total_broken": 0, "confirmed": 0, "suspected": 0, "sources": {}}
+
+        stats = {
+            "total_broken": len(maintenance_df),
+            "confirmed": int((maintenance_df["status"] == "confirmed").sum()),
+            "suspected": int((maintenance_df["status"] == "suspected").sum()),
+            "avg_gap_sec": round(float(maintenance_df["gap_sec"].mean()), 2),
+            "avg_pred_error_m": round(float(maintenance_df["pred_error_m"].mean()), 2),
+            "sources": {},
+        }
+        for src, grp in maintenance_df.groupby("source"):
+            stats["sources"][src] = {
+                "broken_count": len(grp),
+                "confirmed": int((grp["status"] == "confirmed").sum()),
+            }
+        return stats
