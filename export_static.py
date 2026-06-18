@@ -142,6 +142,63 @@ def export_network():
         print(f"  network.json: exported")
 
 
+def export_rmse():
+    path = os.path.join(OUTPUT_DIR, "rmse_metrics.json")
+    if not os.path.exists(path):
+        return
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    with open(os.path.join(DOCS_DIR, "rmse.json"), "w") as f:
+        json.dump(data, f)
+    print(f"  rmse.json: fused={data.get('fused_prediction_rmse_m',0):.1f}m")
+
+
+def export_spectrum_pog():
+    path = os.path.join(OUTPUT_DIR, "spectrum_pog_report.json")
+    if not os.path.exists(path):
+        return
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    with open(os.path.join(DOCS_DIR, "spectrum_pog.json"), "w") as f:
+        json.dump(data, f)
+    print(f"  spectrum_pog.json: detections={data.get('n_detections',0)}")
+
+
+def export_track_maintenance():
+    """导出航迹维持结果"""
+    path = os.path.join(OUTPUT_DIR, "track_maintenance.csv")
+    if not os.path.exists(path):
+        # 从 flow_report 中提取
+        rp = os.path.join(OUTPUT_DIR, "flow_report.json")
+        if os.path.exists(rp):
+            with open(rp, "r", encoding="utf-8") as f:
+                report = json.load(f)
+            maint = report.get("track_maintenance", {})
+            with open(os.path.join(DOCS_DIR, "track_maintenance.json"), "w") as f:
+                json.dump(maint, f)
+            print(f"  track_maintenance.json: from flow_report")
+        return
+    df = pd.read_csv(path)
+    if "status" in df.columns:
+        confirmed = int((df["status"] == "confirmed").sum())
+        suspected = int((df["status"] == "suspected").sum())
+    elif "confirmed" in df.columns:
+        confirmed = int(df["confirmed"].sum())
+        suspected = len(df) - confirmed
+    else:
+        confirmed = 0
+        suspected = len(df)
+    data = {
+        "total_broken_pairs": len(df),
+        "confirmed": confirmed,
+        "suspected": suspected,
+        "sample": df.head(20).fillna("").to_dict(orient="records")
+    }
+    with open(os.path.join(DOCS_DIR, "track_maintenance.json"), "w") as f:
+        json.dump(data, f)
+    print(f"  track_maintenance.json: {data['total_broken_pairs']} pairs")
+
+
 if __name__ == "__main__":
     print("导出静态数据到 docs/data/ ...")
     export_summary()
@@ -150,4 +207,7 @@ if __name__ == "__main__":
     export_conflicts()
     export_flow()
     export_network()
+    export_rmse()
+    export_spectrum_pog()
+    export_track_maintenance()
     print("完成！")
